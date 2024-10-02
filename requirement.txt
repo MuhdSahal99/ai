@@ -1,8 +1,0 @@
-Flask
-flask-cors
-Werkzeug
-PyPDF2
-python-docx
-faiss-cpu
-sentence-transformers
-numpy

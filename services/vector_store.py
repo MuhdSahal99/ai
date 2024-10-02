@@ -1,128 +1,238 @@
-import faiss
+
 import numpy as np
 import pickle
 import os
 from sentence_transformers import SentenceTransformer
-from typing import Union, List, Tuple
+from typing import Union, List, Tuple, Optional
 from models.resume import Resume
 from services.job_description_processor import JobDescription
 from services.interview_script_processor import InterviewScript
 import logging
 import time
+import dotenv
+from pinecone import Pinecone, ServerlessSpec
+
+dotenv.load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 class VectorStore:
-    def __init__(self, base_path='vectordb'):
+    def __init__(self, index_name='recruiter', dimension=384):
         self.model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
-        self.vector_size = 384  # Depends on the model you're using
-        self.base_path = base_path
-        self.indices = {}
-        self.data = {}
-        self.load()
+        self.vector_size = dimension
+        self.index_name = index_name
+        self.data = {'resume': [], 'job_description': [], 'interview_script': []}
+        
+        # Initialize Pinecone
+        self.pc = Pinecone(api_key=os.getenv('PINECONE_API_KEY'))
+        
+        # Create index if it doesn't exist
+        if self.index_name not in self.pc.list_indexes().names():
+            self.pc.create_index(
+                name=self.index_name,
+                dimension=self.vector_size,
+                metric='cosine',
+                spec=ServerlessSpec(
+                    cloud=os.getenv('PINECONE_CLOUD', 'aws'),
+                    region=os.getenv('PINECONE_REGION', 'us-west-2')
+                )
+            )
+        
+        self.index = self.pc.Index(self.index_name)
 
-    def load(self):
-        for doc_type in ['resume', 'job_description', 'interview_script']:
-            index_path = os.path.join(self.base_path, f'{doc_type}_index.faiss')
-            data_path = os.path.join(self.base_path, f'{doc_type}_data.pkl')
-            if os.path.exists(index_path) and os.path.exists(data_path):
-                self.indices[doc_type] = faiss.read_index(index_path)
-                with open(data_path, 'rb') as f:
-                    self.data[doc_type] = pickle.load(f)
-            else:
-                self.indices[doc_type] = faiss.IndexFlatL2(self.vector_size)
-                self.data[doc_type] = []
-        self.save()  # Save the empty indices and data lists if they didn't exist
-
-    def save(self):
-        os.makedirs(self.base_path, exist_ok=True)
-        for doc_type in ['resume', 'job_description', 'interview_script']:
-            index_path = os.path.join(self.base_path, f'{doc_type}_index.faiss')
-            data_path = os.path.join(self.base_path, f'{doc_type}_data.pkl')
-            faiss.write_index(self.indices[doc_type], index_path)
-            with open(data_path, 'wb') as f:
-                pickle.dump(self.data[doc_type], f)
+    
     
     
 
-    def add_to_vector_store(self, item: Union[Resume, JobDescription, InterviewScript]) -> int:
-        doc_type = self._get_doc_type(item)
-        vector = self.model.encode([item.text_content])[0]
-        vector = vector / np.linalg.norm(vector)
-        vector = np.array([vector]).astype('float32')
-        self.indices[doc_type].add(vector)
-        vector_id = self.indices[doc_type].ntotal - 1
-        item.vector_id = vector_id
-       
-        if doc_type == 'job_description':
-            if item.id is None:
-                item.id = int(time.time() * 1000)
-            logging.info(f"Adding job description with ID: {item.id}")
-        elif doc_type == 'resume':
-            if not hasattr(item, 'created_at'):
-                item.created_at = time.time()
-            logging.info(f"Adding resume with created_at: {item.created_at}")
-
-        self.data[doc_type].append(item)
-        self.save()
-        return vector_id
+    def add_to_vector_store(self, item: Union[Resume, JobDescription, InterviewScript]) -> str:
+        try:
+            doc_type = self._get_doc_type(item)
+            logger.info(f"Adding item of type {doc_type} to vector store")
+            
+            # Ensure text_content is a string
+            text_content = str(item.text_content)
+            vector = self.model.encode([text_content])[0].tolist()
+            
+            # Generate a unique ID for the item
+            item_id = f"{doc_type}_{int(time.time() * 1000)}"
+            
+            # Add metadata
+            metadata = {
+                "type": doc_type,
+                "id": str(item.id),
+                "created_at": item.created_at,
+                "original_filename": item.original_filename,
+                "text_content": text_content  # Store text_content in metadata
+            }
+            
+            # Upsert to Pinecone
+            self.index.upsert(vectors=[(item_id, vector, metadata)])
+            
+            # Update local data structure
+            item.vector_id = item_id
+            self.data[doc_type].append(item)
+            
+            logger.info(f"{doc_type.capitalize()} added successfully with vector_id: {item_id}")
+            return item_id
+        except Exception as e:
+            logger.error(f"Error in add_to_vector_store: {str(e)}", exc_info=True)
+            raise
+            
     
     def get_all_job_ids(self) -> List[int]:
-        job_ids = [job.id for job in self.data.get('job_description', []) if job.id is not None]
-        logging.info(f"Retrieved job IDs: {job_ids}")
-        return job_ids
+        # Query Pinecone for all job descriptions
+        results = self.index.query(
+            vector=[0] * self.vector_size,  # Dummy vector
+            top_k=100,  # Adjust based on expected maximum number of jobs
+            include_metadata=True,
+            filter={"type": "job_description"}
+        )
+        return [int(match.metadata['id']) for match in results.matches if match.metadata['id']]
     
     def get_most_recent_resume(self) -> Union[Resume, None]:
-        resumes = self.data.get('resume', [])
-        if not resumes:
-            return None
+        # Query all resumes and sort by created_at timestamp
+        results = self.index.query(
+            vector=[0] * self.vector_size,  # Still a dummy vector if needed
+            top_k=100,  # Increase the top_k to ensure more results are checked
+            include_metadata=True,
+            filter={"type": "resume"}
+        )
         
-        current_time = time.time()
-        for resume in resumes:
-            if not hasattr(resume, 'created_at'):
-                resume.created_at = current_time
-                logging.warning(f"Resume {resume.id} did not have 'created_at' attribute. Setting to current time.")
+        if results.matches:
+            # Sort matches by created_at if it's included in metadata
+            sorted_matches = sorted(results.matches, key=lambda x: x.metadata.get('created_at', 0), reverse=True)
+            metadata = sorted_matches[0].metadata
+            return Resume(
+                text_content=str(metadata.get('text_content', '')),
+                original_filename=metadata.get('original_filename', ''),
+                id=int(metadata.get('id', 0)),
+                vector_id=sorted_matches[0].id,
+                created_at=metadata.get('created_at', 0)
+            )
         
-        most_recent = max(resumes, key=lambda x: x.created_at)
-        logging.info(f"Retrieved most recent resume with created_at: {most_recent.created_at}")
-        return most_recent
+        return None
         
 
-    def search(self, query: str, doc_type: str, k: int = 5) -> List[Tuple[int, float]]:
-        query_vector = self.model.encode([query])[0]
-        query_vector = query_vector / np.linalg.norm(query_vector)  # Normalize the query vector
-        query_vector = np.array([query_vector]).astype('float32')
-
-        # Ensure we're using the correct index for the document type
-        index = self.indices[doc_type]
+    def search(self, query: str, doc_type: str, k: int = 5) -> List[Tuple[str, float]]:
+        query_vector = self.model.encode([query])[0].tolist()
         
-        # Perform the search
-        distances, indices = index.search(query_vector, k)
+        results = self.index.query(
+            vector=query_vector,
+            top_k=k,
+            include_metadata=True,
+            filter={"type": doc_type}
+        )
         
-        # Calculate cosine similarity for each returned index
-        results = []
-        for i, idx in enumerate(indices[0]):
-            vector = index.reconstruct(int(idx))
-            cosine_similarity = np.dot(vector, query_vector[0]) / (np.linalg.norm(vector) * np.linalg.norm(query_vector[0]))
-            # Ensure similarity scores are between 0 and 1
-            cosine_similarity = (cosine_similarity + 1) / 2
-            results.append((int(idx), cosine_similarity))
-        
-        return results
+        return [(match.id, match.score) for match in results.matches]
     
     def get_all_items(self, doc_type: str):
         return [item.to_dict() for item in self.data[doc_type]]
     
     
 
-    def get_job_description(self, job_id: int) -> Union[JobDescription, None]:
-        job_descriptions = self.data.get('job_description', [])
-        logging.info(f"Searching for job ID: {job_id} among {len(job_descriptions)} job descriptions")
-        for job in job_descriptions:
-            if job.id == job_id:
-                logging.info(f"Found job description for ID: {job_id}")
+    def get_job_description(self, vector_id: str) -> Union[JobDescription, None]:
+        logger.debug(f"Attempting to retrieve job description for vector_id: {vector_id}")
+        results = self.index.fetch(ids=[vector_id])
+        if results and vector_id in results['vectors']:
+            metadata = results['vectors'][vector_id]['metadata']
+            logger.debug(f"Retrieved metadata for vector_id {vector_id}: {metadata}")
+            if metadata.get('type') == 'job_description':
+                job = JobDescription(
+                    text_content=str(metadata.get('text_content', '')),
+                    original_filename=metadata.get('original_filename', '')
+                )
+                job.id = int(metadata.get('id', 0))
+                job.created_at = metadata.get('created_at', 0)
+                job.vector_id = vector_id
+                logger.debug(f"Created JobDescription object: {job}")
                 return job
-        logging.warning(f"Job description not found for ID: {job_id}")
+            else:
+                logger.warning(f"Metadata for vector_id {vector_id} is not a job description")
+        else:
+            logger.warning(f"No results found for vector_id: {vector_id}")
         return None
     
+    
+    #employer : most rescent job description
+    def get_most_recent_job_description(self) -> Union[JobDescription, None]:
+        results = self.index.query(
+            vector=[0] * self.vector_size,  # Dummy vector
+            top_k=50,
+            include_metadata=True,
+            filter={"type": "job_description"}
+        )
+        if not results.matches:
+            return None
+        most_recent_match = max(results.matches, key=lambda match: int(match.metadata.get('id', 0)))
+        return self._fetch_item_from_local_data('job_description', most_recent_match.id)
+
+    # resume vector id .
+    def get_resume_by_vector_id(self, vector_id: str) -> Union[Resume, None]:
+        return self._fetch_item_from_local_data('resume', vector_id)
+    
+    # download button 
+    def get_resume_by_id(self, resume_id: int) -> Union[Resume, None]:
+        results = self.index.query(
+            vector=[0] * self.vector_size,  # Dummy vector
+            top_k=1,
+            include_metadata=True,
+            filter={"type": "resume", "id": str(resume_id)}
+        )
+        if results.matches:
+            return self._fetch_item_from_local_data('resume', results.matches[0].id)
+        return None
+    
+    def get_interview_script(self, interview_id: int) -> Union[InterviewScript, None]:
+        results = self.index.query(
+            vector=[0] * self.vector_size,  # Dummy vector
+            top_k=1,
+            include_metadata=True,
+            filter={"type": "interview_script", "id": str(interview_id)}
+        )
+        if results.matches:
+            return self._fetch_item_from_local_data('interview_script', results.matches[0].id)
+        logger.warning(f"Interview script not found for ID: {interview_id}")
+        return None
+    
+    def get_most_recent_interview_script(self) -> Optional[InterviewScript]:
+        results = self.index.query(
+            vector=[0] * self.vector_size,  # Dummy vector
+            top_k=100,
+            include_metadata=True,
+            filter={"type": "interview_script"}
+        )
+        logger.info(f"Found {len(results.matches)} interview scripts in total.")
+
+        if not results.matches:
+            logger.warning("No interview scripts found.")
+            return None
+
+        try:
+            most_recent_match = max(results.matches, key=lambda match: int(match.metadata.get('id', 0)))
+            logger.info(f"Most recent interview script has ID: {most_recent_match.metadata['id']}")
+            return self._fetch_item_from_local_data('interview_script', most_recent_match.id)
+        except Exception as e:
+            logger.exception(f"Unexpected error in get_most_recent_interview_script: {str(e)}")
+            return None
+    
+    def _fetch_item_from_local_data(self, doc_type: str, vector_id: str) -> Union[Resume, JobDescription, InterviewScript, None]:
+        item = next((item for item in self.data[doc_type] if item.vector_id == vector_id), None)
+        if item is None:
+            # If not found in local data, fetch from Pinecone
+            result = self.index.fetch(ids=[vector_id])
+            if result and vector_id in result['vectors']:
+                metadata = result['vectors'][vector_id]['metadata']
+                if doc_type == 'resume':
+                    item = Resume(text_content=str(metadata.get('text_content', '')), original_filename=metadata.get('original_filename', ''))
+                elif doc_type == 'job_description':
+                    item = JobDescription(text_content=str(metadata.get('text_content', '')), original_filename=metadata.get('original_filename', ''))
+                elif doc_type == 'interview_script':
+                    item = InterviewScript(text_content=str(metadata.get('text_content', '')), original_filename=metadata.get('original_filename', ''))
+                item.id = int(metadata.get('id', 0))
+                item.created_at = metadata.get('created_at', 0)
+                item.vector_id = vector_id
+                self.data[doc_type].append(item)
+        return item
 
     def _get_doc_type(self, item: Union[Resume, JobDescription, InterviewScript]) -> str:
         if isinstance(item, Resume):
